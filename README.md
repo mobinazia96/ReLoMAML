@@ -61,4 +61,4 @@ On miniImageNet, measured training time was reduced by **36.0% (1-shot)** and **
 
 ## Acknowledgment
 
-The experiments build on [Torchmeta](https://github.com/tristandeleu/pytorch-meta). See the paper *ReLoMAML: Reusing Low-Rank Adaptation Capacity for Parameter-Efficient Meta-Learning* for the full method and experimental details.
+The experiments build on [Torchmeta](https://github.com/tristandeleu/pytorch-meta). 
