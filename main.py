@@ -1,6 +1,9 @@
-import os
+"""Command-line entry point for ReLoMAML training and evaluation."""
+
 import argparse
+import os
 import random
+
 import numpy as np
 import torch
 
@@ -8,351 +11,95 @@ from train import train
 from test import test
 
 
-if __name__ == '__main__':
+def parse_args():
+    parser = argparse.ArgumentParser(description='ReLoMAML: Shared–Rotating Low-Rank MAML')
 
-    parser = argparse.ArgumentParser('Model-Agnostic Meta-Learning (MAML)')
+    # Experiment and dataset settings.
+    parser.add_argument('--dataset', type=str, default='miniImageNet', help='Training dataset.')
+    parser.add_argument('--test', action='store_true', help='Run evaluation instead of training.')
+    parser.add_argument('--dataset_for_source', type=str, default='miniImageNet', help='Dataset used for training the checkpoint.')
+    parser.add_argument('--dataset_for_target', type=str, default='miniImageNet', help='Dataset used for evaluation.')
+    parser.add_argument('--flags', type=str, default='last', choices=['best', 'last'], help='Checkpoint to evaluate when using the built-in checkpoint selection.')
+    parser.add_argument('--seed', type=int, default=1, help='Random seed.')
+    parser.add_argument('--gpu_id', type=int, default=0, help='GPU index; used only when CUDA is enabled.')
+    parser.add_argument('--folder', type=str, default='./data', help='Local dataset directory.')
+    parser.add_argument('--K_shots_for_support', type=int, default=1, help='Support examples per class.')
+    parser.add_argument('--K_shots_for_query', type=int, default=15, help='Query examples per class.')
+    parser.add_argument('--N_ways', type=int, default=5, help='Number of classes per task.')
+    parser.add_argument('--train_num_update_step', type=int, default=2, help='Number of inner-loop steps in training.')
+    parser.add_argument('--test_num_update_step', type=int, default=10, help='Number of inner-loop steps in validation and testing.')
+    parser.add_argument('--first-order', action='store_true', help='Use first-order approximation (not used for the second-order MAML results in the paper).')
+    parser.add_argument('--inner_lr', type=float, default=0.01, help='Inner-loop learning rate (where used by the training implementation).')
+    parser.add_argument('--hidden_size', type=int, default=128, help='Channels per convolutional layer.')
+    parser.add_argument('--batch_size', type=int, default=4, help='Tasks per meta-batch.')
+    parser.add_argument('--iter', type=int, default=60000, help='Number of meta-training iterations.')
+    parser.add_argument('--num-workers', type=int, default=0, help='Number of data-loader workers.')
+    parser.add_argument('--download', action='store_true', help='Download the dataset if supported by the dataset loader.')
+    parser.add_argument('--use-cuda', action='store_true', help='Use CUDA if available.')
+    parser.add_argument('--outer_lr1', type=float, default=1e-4, help='Outer-loop learning rate for MAML parameters (where used).')
 
-    # Argument for train
-    parser.add_argument(
-        '--dataset',
-        type=str,
-        default='miniImageNet',
-        help='The dataset to train the model.'
-    )
+    # ReLoMAML low-rank parameterization.
+    parser.add_argument('--shared_rank', type=int, default=16, help='Shared rank for convolutional layers except the first.')
+    parser.add_argument('--rotating_rank', type=int, default=4, help='Rotating rank for convolutional layers except the first.')
+    parser.add_argument('--first_layer_shared_rank', type=int, default=10, help='Shared rank for the first convolutional layer.')
+    parser.add_argument('--first_layer_rotating_rank', type=int, default=6, help='Rotating rank for the first convolutional layer.')
+    parser.add_argument('--lora_alpha', type=float, default=1.0, help='Fixed LoRA scaling numerator (alpha).')
+    parser.add_argument('--first_layer_lora_alpha', type=float, default=1.0, help='Fixed LoRA scaling numerator for the first layer.')
+    parser.add_argument('--warmup_iterations', type=int, default=10000, help='Meta-iterations before warm-up finalization.')
+    parser.add_argument('--rotation_interval', type=int, default=3500, help='Meta-iterations between subspace rotations.')
+    rotation = parser.add_mutually_exclusive_group()
+    rotation.add_argument('--enable_rotation', dest='enable_rotation', action='store_true', help='Enable rotating-subspace replacement (default).')
+    rotation.add_argument('--disable_rotation', dest='enable_rotation', action='store_false', help='Disable rotating-subspace replacement for ablations.')
+    parser.set_defaults(enable_rotation=True)
+    parser.add_argument('--lora_outer_lr', type=float, default=0.005, help='Outer-loop learning rate for low-rank factors.')
+    parser.add_argument('--classifier_inner_lr', type=float, default=0.001, help='Inner-loop learning rate for the classifier.')
 
-    # Argument for test
-    parser.add_argument(
-        '--test',
-        action='store_true'
-    )
+    # Outputs and diagnostics.
+    parser.add_argument('--output_root', type=str, default='./results', help='Directory for experiment logs and checkpoints.')
+    parser.add_argument('--exp_name', type=str, default='rank20', help='Experiment subdirectory name.')
+    parser.add_argument('--load_path', type=str, default=None, help='Checkpoint path for testing.')
+    parser.add_argument('--debug_lora', action='store_true', help='Print low-rank diagnostics.')
+    parser.add_argument('--debug_batches', type=int, default=2, help='Number of initial meta-iterations for diagnostics.')
 
-    parser.add_argument(
-        '--dataset_for_source',
-        type=str,
-        default='miniImageNet',
-        help='The dataset used to train the model.'
-    )
+    return parser.parse_args()
 
-    parser.add_argument(
-        '--dataset_for_target',
-        type=str,
-        default='miniImageNet',
-        help='The dataset to test the trained model.'
-    )
 
-    parser.add_argument(
-        '--flags',
-        type=str,
-        default='last',
-        help='best or last'
-    )
+def main():
+    args = parse_args()
 
-    # Random seed
-    parser.add_argument(
-        '--seed',
-        type=int,
-        default=1,
-        help='Random seed.'
-    )
+    # Device selection. For reliable GPU selection, CUDA must not have been initialized yet.
+    os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_id)
 
-    # Argument for both train and test
-    parser.add_argument(
-        '--gpu_id',
-        type=int,
-        default=0,
-        help='GPU ID'
-    )
-
-    parser.add_argument(
-        '--folder',
-        type=str,
-        default='/home/math/zi/dr_rezghi_5090/',
-        help='Path to the folder the data is downloaded to.'
-    )
-
-    parser.add_argument(
-        '--K_shots_for_support',
-        type=int,
-        default=1,
-        help='The number of support set examples per class (i.e., K in "K-shot").'
-    )
-
-    parser.add_argument(
-        '--K_shots_for_query',
-        type=int,
-        default=15,
-        help='The number of query set examples per class.'
-    )
-
-    parser.add_argument(
-        '--N_ways',
-        type=int,
-        default=5,
-        help='The number of classes per task (i.e., N in "N-way").'
-    )
-
-    parser.add_argument(
-        '--train_num_update_step',
-        type=int,
-        default=2,
-        help='The number of update-step in the inner loop process during training.'
-    )
-
-    parser.add_argument(
-        '--test_num_update_step',
-        type=int,
-        default=10,
-        help='The number of update-step in the inner loop process during validating/testing.'
-    )
-
-    parser.add_argument(
-        '--first-order',
-        action='store_true',
-        help='Use the first-order approximation of MAML.'
-    )
-
-    parser.add_argument(
-        '--inner_lr',
-        type=float,
-        default=0.01,
-        help='The step-size for the gradient step for adaptation.'
-    )
-
-    parser.add_argument(
-        '--hidden_size',
-        type=int,
-        default=128,
-        help='The number of channels for each convolutional layer.'
-    )
-
-    parser.add_argument(
-        '--batch_size',
-        type=int,
-        default=4,
-        help='The number of tasks in a mini-batch of tasks.'
-    )
-
-    parser.add_argument(
-        '--iter',
-        type=int,
-        default=60000,
-        help='The number of iteration for training'
-    )
-
-    parser.add_argument(
-        '--num-workers',
-        type=int,
-        default=0,
-        help='The number of workers for data loading (default: 1).'
-    )
-
-    parser.add_argument(
-        '--download',
-        action='store_true',
-        help='Download the dataset in the data folder.'
-    )
-
-    parser.add_argument(
-        '--use-cuda',
-        action='store_true',
-        help='Use CUDA if available.'
-    )
-
-    parser.add_argument(
-        '--top_k',
-        type=int,
-        default=5,
-        help='The number of models used in the ensemble (if you want).'
-    )
-
-    parser.add_argument(
-        '--outer_lr1',
-        type=float,
-        default=1e-4,
-        help='The learning rate for initialization in MAML.'
-    )
-
-    parser.add_argument(
-        '--outer_lr2',
-        type=float,
-        default=1e-4,
-        help='The learning rate for meta-parameters (i.e., for preconditioner).'
-    )
-
-    parser.add_argument(
-        '--GAP',
-        action='store_true',
-        help='Use the GAP in MAML.'
-    )
-
-    parser.add_argument(
-        '--approx',
-        action='store_true',
-        help='Use the approximation of GAP'
-    )
-
-    # SR-LoRA arguments
-    parser.add_argument(
-        '--shared_rank',
-        type=int,
-        default=10,
-        help='Rank of the persistent shared SRLoRA branch.'
-    )
-
-    parser.add_argument(
-        '--rotating_rank',
-        type=int,
-        default=6,
-        help='Rank of the rotating SRLoRA branch.'
-    )
-
-    parser.add_argument(
-        '--first_layer_shared_rank',
-        type=int,
-        default=None
-    )
-
-    parser.add_argument(
-        '--first_layer_rotating_rank',
-        type=int,
-        default=None
-    )
-
-    parser.add_argument(
-        '--first_layer_lora_alpha',
-        type=float,
-        default=None
-    )
-
-    parser.add_argument(
-        '--lora_alpha',
-        type=float,
-        default=16.0,
-        help='SRLoRA scaling parameter.'
-    )
-
-    parser.add_argument(
-        '--warmup_iterations',
-        type=int,
-        default=10000,
-        help='Number of meta-iterations before SRLoRA rotation begins.'
-    )
-
-    parser.add_argument(
-        '--rotation_interval',
-        type=int,
-        default=3500,
-        help='Number of meta-iterations between SRLoRA rotations.'
-    )
-
-    parser.add_argument(
-        '--enable_rotation',
-        action='store_true',
-        help='Enable SRLoRA rotating-subspace replacement.'
-    )
-
-    parser.add_argument(
-        '--output_root',
-        type=str,
-        default='./results',
-        help='Root directory for logs and checkpoints.'
-    )
-
-    parser.add_argument(
-        '--exp_name',
-        type=str,
-        default='default',
-        help='Name of the experiment subdirectory.'
-    )
-
-    parser.add_argument(
-        '--classifier_inner_lr',
-        type=float,
-        default=0.001,
-        help='Inner-loop learning rate for the classifier.'
-    )
-
-    parser.add_argument(
-        '--debug_lora',
-        action='store_true',
-        help='Print LoRA diagnostics during the first meta-iterations.'
-    )
-
-    parser.add_argument(
-        '--debug_batches',
-        type=int,
-        default=2,
-        help='Number of initial meta-iterations to debug.'
-    )
-
-    parser.add_argument(
-        '--load_path',
-        type=str,
-        default=None,
-        help='Path to the trained checkpoint for testing.'
-    )
-
-    parser.add_argument(
-        '--lora_outer_lr',
-        type=float,
-        default=0.005
-    )
-
-    args = parser.parse_args()
-
-    # ---------------------------------------------------------
-    # GPU selection
-    # ---------------------------------------------------------
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
-
-    # ---------------------------------------------------------
-    # Set random seed
-    # ---------------------------------------------------------
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(args.seed)
         torch.cuda.manual_seed_all(args.seed)
 
-    # ---------------------------------------------------------
-    # Check SR-LoRA arguments
-    # ---------------------------------------------------------
-    if args.shared_rank < 0:
-        raise ValueError('shared_rank must be non-negative.')
-
-    if args.rotating_rank < 0:
-        raise ValueError('rotating_rank must be non-negative.')
-
+    if args.shared_rank < 0 or args.rotating_rank < 0:
+        raise ValueError('Shared and rotating ranks must be non-negative.')
     if args.shared_rank + args.rotating_rank <= 0:
-        raise ValueError('Total SRLoRA rank must be positive.')
-
-    if args.lora_alpha <= 0:
-        raise ValueError('lora_alpha must be positive.')
-
+        raise ValueError('Total ReLoMAML rank must be positive.')
+    if args.first_layer_shared_rank < 0 or args.first_layer_rotating_rank < 0:
+        raise ValueError('First-layer ranks must be non-negative.')
+    if args.first_layer_shared_rank + args.first_layer_rotating_rank <= 0:
+        raise ValueError('Total first-layer rank must be positive.')
+    if args.lora_alpha <= 0 or args.first_layer_lora_alpha <= 0:
+        raise ValueError('LoRA alpha must be positive for all layers.')
     if args.warmup_iterations < 0:
-        raise ValueError('warmup_iterations must be non-negative.')
-
+        raise ValueError('Warm-up iterations must be non-negative.')
     if args.rotation_interval <= 0:
-        raise ValueError('rotation_interval must be positive.')
+        raise ValueError('Rotation interval must be positive.')
 
     args.total_rank = args.shared_rank + args.rotating_rank
+    args.device = torch.device('cuda' if args.use_cuda and torch.cuda.is_available() else 'cpu')
 
-    # ---------------------------------------------------------
-    # Device
-    # ---------------------------------------------------------
-    args.device = torch.device(
-        'cuda'
-        if args.use_cuda and torch.cuda.is_available()
-        else 'cpu'
-    )
-
-    # ---------------------------------------------------------
-    # Train / Test
-    # ---------------------------------------------------------
     if args.test:
         test(args)
     else:
         train(args)
+
+
+if __name__ == '__main__':
+    main()
